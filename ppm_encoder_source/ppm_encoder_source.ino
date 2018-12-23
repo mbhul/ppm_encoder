@@ -2,14 +2,18 @@
  * PPM generator originally written by David Hasko
  * on https://code.google.com/p/generate-ppm-signal/ 
  */
+#include <EEPROM.h>
 
 //////////////////////CONFIGURATION///////////////////////////////
 #define NUM_CHANNELS 8              //set the number of channels
 #define CHANNEL_DEFAULT_VALUE 1500  //set the default servo value
 #define FRAME_LENGTH 22000          //set the PPM frame length in microseconds (1ms = 1000µs)
-#define PULSE_LENGTH 300            //set the pulse length (us)
+#define PULSE_LENGTH 500            //set the pulse length (us)
 #define ON_STATE 1                  //set polarity of the pulses: 1 is HIGH, 0 is LOW
 #define SIG_PIN 10                  //set PPM signal output pin on the arduino
+
+#define PPM_MIN 1000
+#define PPM_MAX 2000
 
 #define SWITCH_STEP 25              //Default PPM step size (us)
 #define CMD_LEN 64                  //Max length of Serial command (# characters)
@@ -21,8 +25,8 @@
 //////////////////////////////////////////////////////////////////
 
 /* GLOBAL VARIABLES */
-byte inStr[CMD_LEN];
-byte outStr[CMD_LEN];
+char inStr[CMD_LEN];
+char outStr[CMD_LEN];
 boolean record_next_frame = false;
 
 /*Channel and state variables */
@@ -31,6 +35,7 @@ byte cur_chan_numb = 0;
 
 /* This array holds the servo values for the ppm signal (in us)*/
 int ppm[NUM_CHANNELS];
+int ppm_offsets[NUM_CHANNELS];
 
 /* Array to output data on serial for test */
 byte ppm_test_array[ARRAY_FRAME_SIZE+1];
@@ -40,17 +45,27 @@ byte ppm_test_array[ARRAY_FRAME_SIZE+1];
  ***************************/
 void setup()
 {  
+  int offset_addr = 0;
+  int offset = 0;
+
   //initiallize default ppm values
   for(int i=0; i<NUM_CHANNELS; i++)
   {
+     ppm_offsets[i] = 0;
      if (i == THROTTLE_CHAN)
      {
         ppm[i]= DEFAULT_THROTTLE_VALUE;
      }
      else
      {
-        ppm[i]= CHANNEL_DEFAULT_VALUE;
+        //Read the rigging offset from EEPROM
+        EEPROM.get(offset_addr, offset);
+        ppm_offsets[i] = offset;
+        
+        //Set the initial PPM value
+        ppm[i]= CHANNEL_DEFAULT_VALUE + ppm_offsets[i];
      }
+     offset_addr += sizeof(int);
   }
 
   //Configure the PPM signal output pin and set its default state
@@ -88,6 +103,11 @@ void setup()
   sei();
 
   Serial.begin(9600);
+
+//  Serial.write("test sizeof(int)",16);
+//  Serial.write("\r\n",2);
+//  Serial.write(String(sizeof(int)).c_str(),1);
+//  Serial.write("\r\n",2);
 }
 
 /*************************************************************
@@ -102,7 +122,7 @@ void loop()
 {
    static boolean record_prev = false;
    static int index = 0;
-   byte temp = 0;
+   char temp = 0;
 
    if (Serial.available()) 
    {
@@ -115,7 +135,7 @@ void loop()
       {
          //Parse the input string
          ppmParseCommand(inStr, index);
-
+         
          //Debug: output the parsed PPM values for validation
          for(int i = 0; i < NUM_CHANNELS; i++)
          {
@@ -152,44 +172,102 @@ void loop()
  * 
  * Where: 'CHx' is a value between 1000 and 2000
  ********************************************************************************/
-void ppmParseCommand(byte* cmdString, int cmdLength)
+void ppmParseCommand(char* cmdString, int cmdLength)
 {
    char temp[4] = {0,0,0,0};
    int index = 0;
    int channel_num = 0;
    int temp_ppm;
 
-   for(int i = 0; i < cmdLength; i++)
+   if (strcmp(cmdString, "RIG;") == 0)
    {
-      //Comma or semi-colon always succeeds a channel ppm value
-      if((cmdString[i] == ',' || cmdString[i] == ';') && channel_num < NUM_CHANNELS)
+      performRigging();
+      Serial.write("\r\n",2);
+      Serial.write("RIGGING COMPLETE",16);
+      Serial.write("\r\n",2);
+   }
+   else if (strcmp(cmdString, "RIG_CLR;") == 0)
+   {
+      clearEEPROM();
+      Serial.write("\r\n",2);
+      Serial.write("EEPROM CLEARED",14);
+      Serial.write("\r\n",2);
+   }
+   else
+   {
+      for(int i = 0; i < cmdLength; i++)
       {
-         //set to previous value in case the toInt() conversion fails
-         temp_ppm = ppm[channel_num];
-         
-         //Parse the PPM value
-         temp_ppm = String(temp).toInt();
-         if(temp_ppm < 1000)
+         //Comma or semi-colon always succeeds a channel ppm value
+         if((cmdString[i] == ',' || cmdString[i] == ';') && channel_num < NUM_CHANNELS)
          {
-           temp_ppm = 1000;
+            //set to previous value in case the toInt() conversion fails
+            temp_ppm = ppm[channel_num];
+   
+            //Parse the PPM value
+            temp_ppm = String(temp).toInt();
+              
+            if(temp_ppm < PPM_MIN)
+            {
+              temp_ppm = PPM_MIN;
+            }
+            else if (temp_ppm > PPM_MAX)
+            {
+              temp_ppm = PPM_MAX;
+            }
+            ppm[channel_num] = temp_ppm + ppm_offsets[channel_num];
+            channel_num++;
+            index = 0;
+            memset(temp,0,4);
          }
-         else if (temp_ppm > 2000)
-         {
-           temp_ppm = 2000;
+         //Buffer the input PPM value characters
+         else
+         {  
+            temp[0] = temp[1];
+            temp[1] = temp[2];
+            temp[2] = temp[3];
+            temp[3] = cmdString[i];
          }
-         ppm[channel_num++] = temp_ppm;
-         index = 0;
-         memset(temp,0,4);
-      }
-      //Buffer the input PPM value characters
-      else
-      {  
-         temp[0] = temp[1];
-         temp[1] = temp[2];
-         temp[2] = temp[3];
-         temp[3] = cmdString[i];
       }
    }
+}
+
+/*******************************************************************************
+ * FUNCTION: performRigging
+ * 
+ * This function stores the difference (PPM[i] - Default Value) for each PPM channel
+ * as an offset to be applied to the output PPM.
+ * 
+ * The premise is to detect and apply the zero-offset when the control surfaces
+ * (ex. elevators, rudder) are mechanically centered, so that the 'no-input' condition
+ * can actually center the aircraft.
+ * 
+ * NOTE: This is only intended for slight adjustments. If the mechanical centre value
+ *       is off by more than 100 counts, the range of performance will be degraded
+ ********************************************************************************/
+void performRigging()
+{
+  int offset_addr = 0;
+  int offset = 0;
+
+  for(int i=0; i<NUM_CHANNELS; i++)
+  {
+     ppm_offsets[i] = 0;
+     if (i != THROTTLE_CHAN)
+     {
+        offset = ppm[i] - CHANNEL_DEFAULT_VALUE;
+        EEPROM.put(offset_addr, offset);
+        ppm_offsets[i] = offset;
+     }
+     offset_addr += sizeof(int);
+  }
+}
+
+void clearEEPROM()
+{
+  for (int i = 0 ; i < EEPROM.length() ; i++) 
+  {
+    EEPROM.write(i, 0);
+  }
 }
 
 /*************************************************************
